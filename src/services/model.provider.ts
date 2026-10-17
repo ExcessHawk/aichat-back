@@ -440,8 +440,17 @@ export class GeminiModelProvider implements ModelProvider {
 
     if (!res.ok || !res.body) {
       const detalle = await res.text().catch(() => '');
-      // El log se queda con todo; la burbuja, solo con la frase.
+      // El log se queda con todo; la burbuja, solo con lo que sirve.
       if (detalle) console.error(`Gemini ${res.status}: ${detalle.slice(0, 600)}`);
+
+      // Una cuota agotada no es culpa de quien escribió, y "your project has
+      // exceeded a quota" no le dice nada a quien está mirando la demostración.
+      if (res.status === 429) {
+        throw new Error(
+          'El modelo está recibiendo más peticiones de las que admite ahora mismo. Espera un momento y vuelve a intentar.',
+        );
+      }
+
       throw new Error(
         `El modelo respondió ${res.status}${detalle ? `: ${mensajeDeError(detalle)}` : ''}`,
       );
