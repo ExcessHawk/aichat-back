@@ -269,6 +269,7 @@ export class ChatService {
     input.requestSignal?.addEventListener('abort', abortar, { once: true });
 
     let acumulado = '';
+    let motivoFin = '';
     let entrada = 0;
     let salida = 0;
     let completo = false;
@@ -292,6 +293,10 @@ export class ChatService {
       )) {
         if (evento.type === 'latido') {
           yield evento;
+          continue;
+        }
+        if (evento.type === 'fin') {
+          motivoFin = evento.motivo;
           continue;
         }
         if (evento.type === 'text') {
@@ -326,6 +331,18 @@ export class ChatService {
       // El usage va antes del done para que el contador de la interfaz ya esté
       // puesto cuando la burbuja deja de parpadear.
       yield { type: 'usage', inputTokens: entrada, outputTokens: salida, costCents: costo };
+
+      // Una respuesta vacía y cobrada tiene que explicarse. Pasa, por ejemplo,
+      // cuando el modelo gasta todo su presupuesto pensando y no le queda para
+      // contestar: la burbuja sale en blanco y el contador sube igual.
+      if (!acumulado.trim()) {
+        yield {
+          type: 'error',
+          message: motivoFin
+            ? `El modelo terminó sin escribir nada (${motivoFin}). Prueba otra vez o con una pregunta más corta.`
+            : 'El modelo terminó sin escribir nada. Prueba otra vez.',
+        };
+      }
       yield { type: 'done', messageId: asistente.id, stopped: false };
     } finally {
       // Cortar aquí es lo que deja de pagar tokens que nadie va a leer.

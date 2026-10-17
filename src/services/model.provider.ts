@@ -25,7 +25,14 @@ export interface ModelUsage {
 
 export type ModelEvent =
   | { type: 'text'; text: string }
-  | { type: 'usage'; usage: ModelUsage };
+  | { type: 'usage'; usage: ModelUsage }
+  /**
+   * Por qué terminó la respuesta, en las palabras del proveedor.
+   *
+   * Importa cuando no llegó texto: una respuesta vacía y cobrada necesita
+   * explicarse, y la explicación la tiene el proveedor, no nosotros.
+   */
+  | { type: 'fin'; motivo: string };
 
 export interface ModelMessage {
   role: 'user' | 'assistant';
@@ -334,6 +341,8 @@ export class GeminiModelProvider implements ModelProvider {
     private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
     /** Tope duro por respuesta. Lo que no se genera no se paga. */
     private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 800),
+    /** Cuánto puede pensar antes de contestar. Cero lo apaga. */
+    private readonly thinkingBudget = Number(process.env.GEMINI_THINKING_BUDGET ?? 0),
   ) {
     if (!apiKey) throw new ModelConfigurationError('Falta GEMINI_API_KEY');
     this.models = modelosDeEntorno();
@@ -347,7 +356,14 @@ export class GeminiModelProvider implements ModelProvider {
         parts: [{ text: m.content }],
       })),
       ...(input.system ? { systemInstruction: { parts: [{ text: input.system }] } } : {}),
-      generationConfig: { maxOutputTokens: this.maxOutputTokens },
+      generationConfig: {
+        maxOutputTokens: this.maxOutputTokens,
+        // Los modelos 3.x piensan antes de contestar, y esos tokens salen del
+        // MISMO presupuesto. Con un tope chico el modelo se lo gasta pensando
+        // y devuelve una respuesta vacía que igual se cobra. Un presupuesto de
+        // cero lo apaga; súbelo si alguna vez interesa el razonamiento.
+        thinkingConfig: { thinkingBudget: this.thinkingBudget },
+      },
     };
   }
 
@@ -375,6 +391,7 @@ export class GeminiModelProvider implements ModelProvider {
     const lector = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let motivo = '';
     const usage: ModelUsage = { inputTokens: 0, outputTokens: 0 };
 
     while (true) {
@@ -415,6 +432,9 @@ export class GeminiModelProvider implements ModelProvider {
           usage.inputTokens = meta.promptTokenCount ?? usage.inputTokens;
           usage.outputTokens = meta.candidatesTokenCount ?? usage.outputTokens;
         }
+
+        const razon = evento.candidates?.[0]?.finishReason;
+        if (typeof razon === 'string') motivo = razon;
       }
     }
 
@@ -424,6 +444,7 @@ export class GeminiModelProvider implements ModelProvider {
       usage.inputTokens = approximateTokens(input.messages.map((m) => m.content).join(' '));
     }
     yield { type: 'usage', usage };
+    if (motivo) yield { type: 'fin', motivo };
   }
 
   async title(input: { model: string; messages: ModelMessage[] }): Promise<string> {
