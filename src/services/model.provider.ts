@@ -332,62 +332,89 @@ function modelosDeEntorno(): ModelInfo[] {
 }
 
 
+/**
+ * Gemini por la API de Interacciones.
+ *
+ * No es `models/x:streamGenerateContent`: esa es la generación de contenido de
+ * antes, y contra un modelo 3.x devolvía doscientos con el canal vacío —
+ * aceptaba la petición y no escribía una palabra. Esta API habla de pasos
+ * (`user_input`, `thought`, `model_output`) en vez de roles, y exige la
+ * cabecera de revisión.
+ *
+ * Se trabaja sin estado (`store: false`): la conversación vive en nuestra base
+ * y viaja entera en cada turno. Guardarla también del lado de Google sería
+ * tener la misma verdad en dos sitios.
+ */
 export class GeminiModelProvider implements ModelProvider {
   readonly name = 'gemini';
   readonly models: ModelInfo[];
 
   constructor(
     private readonly apiKey: string,
-    private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
+    private readonly baseUrl = process.env.GEMINI_BASE_URL ??
+      'https://generativelanguage.googleapis.com/v1beta',
     /**
-     * Tope duro por respuesta. Lo que no se genera no se paga, pero aquí cabe
-     * también lo que el modelo piense antes de escribir: quedarse corto hace
-     * que gaste todo razonando y devuelva una respuesta vacía.
+     * Tope duro por respuesta. Aquí cabe también lo que el modelo piense antes
+     * de escribir: quedarse corto hace que gaste todo razonando y conteste
+     * vacío.
      */
     private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 2048),
-    /** Null deja que el modelo decida. Un número lo fuerza; cero lo apaga. */
-    private readonly thinkingBudget: number | null =
-      process.env.GEMINI_THINKING_BUDGET === undefined || process.env.GEMINI_THINKING_BUDGET === ''
-        ? null
-        : Number(process.env.GEMINI_THINKING_BUDGET),
+    /**
+     * Cuánto razona antes de contestar: "low", "medium", "high". Vacío deja
+     * que lo decida el modelo.
+     */
+    private readonly thinkingLevel = process.env.GEMINI_THINKING_LEVEL ?? '',
+    /** La API versiona por cabecera, no por ruta. */
+    private readonly apiRevision = process.env.GEMINI_API_REVISION ?? '2026-05-20',
   ) {
     if (!apiKey) throw new ModelConfigurationError('Falta GEMINI_API_KEY');
     this.models = modelosDeEntorno();
   }
 
-  private cuerpo(input: StreamInput) {
+  private cabeceras() {
     return {
-      contents: input.messages.map((m) => ({
-        // Gemini llama "model" a lo que el resto llama "assistant".
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      })),
-      ...(input.system ? { systemInstruction: { parts: [{ text: input.system }] } } : {}),
-      generationConfig: {
-        maxOutputTokens: this.maxOutputTokens,
-        // Los modelos 3.x piensan antes de contestar y esos tokens salen del
-        // MISMO presupuesto, así que el tope tiene que dar para pensar Y para
-        // responder. Apagar el pensamiento con un presupuesto de cero no es
-        // seguro: hay modelos que entonces no devuelven nada. Por eso solo se
-        // manda si alguien lo pide a propósito.
-        ...(this.thinkingBudget === null ? {} : { thinkingConfig: { thinkingBudget: this.thinkingBudget } }),
+      'content-type': 'application/json',
+      'x-goog-api-key': this.apiKey,
+      'Api-Revision': this.apiRevision,
+    };
+  }
+
+  /** El historial como pasos. Lo que aquí se llama rol, allá es tipo de paso. */
+  private pasos(messages: ModelMessage[]) {
+    return messages.map((m) => ({
+      type: m.role === 'assistant' ? 'model_output' : 'user_input',
+      content: [{ type: 'text', text: m.content }],
+    }));
+  }
+
+  private cuerpo(input: StreamInput, stream: boolean) {
+    return {
+      model: input.model,
+      input: this.pasos(input.messages),
+      stream,
+      // La conversación ya vive en nuestra base; no hace falta una segunda
+      // copia del otro lado.
+      store: false,
+      ...(input.system ? { system_instruction: input.system } : {}),
+      generation_config: {
+        max_output_tokens: this.maxOutputTokens,
+        // Los modelos 3.6 en adelante ignoran temperature, top_p y top_k, y
+        // devuelven avisos de obsolescencia si se mandan. No se mandan.
+        ...(this.thinkingLevel ? { thinking_level: this.thinkingLevel } : {}),
       },
     };
   }
 
   async *stream(input: StreamInput): AsyncIterable<ModelEvent> {
-    const res = await fetch(
-      `${this.baseUrl}/models/${encodeURIComponent(input.model)}:streamGenerateContent?alt=sse`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': this.apiKey },
-        // La señal llega hasta aquí. Sin esto, cancelar solo cierra el canal
-        // con el navegador y el modelo sigue produciendo tokens que ya nadie
-        // va a leer, pero que sí se cobran.
-        signal: input.signal,
-        body: JSON.stringify(this.cuerpo(input)),
-      },
-    );
+    const res = await fetch(`${this.baseUrl}/interactions?alt=sse`, {
+      method: 'POST',
+      headers: this.cabeceras(),
+      // La señal llega hasta aquí. Sin esto, cancelar solo cierra el canal con
+      // el navegador y el modelo sigue produciendo tokens que ya nadie va a
+      // leer, pero que sí se cobran.
+      signal: input.signal,
+      body: JSON.stringify(this.cuerpo(input, true)),
+    });
 
     if (!res.ok || !res.body) {
       const detalle = await res.text().catch(() => '');
@@ -402,6 +429,8 @@ export class GeminiModelProvider implements ModelProvider {
     let motivo = '';
     let ultimoBloque = '';
     let hubotexto = false;
+    /** Qué es cada paso por su índice: un `thought` no es la respuesta. */
+    const tipoDePaso = new Map<number, string>();
     const usage: ModelUsage = { inputTokens: 0, outputTokens: 0 };
 
     while (true) {
@@ -427,83 +456,91 @@ export class GeminiModelProvider implements ModelProvider {
           continue;
         }
 
-        const partes = evento.candidates?.[0]?.content?.parts;
-        if (Array.isArray(partes)) {
-          for (const parte of partes) {
-            if (typeof parte?.text === 'string' && parte.text) {
-              hubotexto = true;
-              yield { type: 'text', text: parte.text };
-            }
-          }
-        }
-
-        // El uso llega en cada trozo y se va actualizando; el último manda.
-        const meta = evento.usageMetadata;
-        if (meta) {
-          usage.inputTokens = meta.promptTokenCount ?? usage.inputTokens;
-          usage.outputTokens = meta.candidatesTokenCount ?? usage.outputTokens;
-        }
-
         ultimoBloque = crudo;
 
-        // Google puede mandar su propio error DENTRO del canal, ya con las
-        // cabeceras enviadas. Sin esto se veía como una respuesta vacía.
+        // Google puede mandar su propio error DENTRO del canal, con las
+        // cabeceras ya enviadas. Sin esto se vería como una respuesta vacía.
         if (evento.error?.message) {
           throw new Error(`El modelo respondió: ${String(evento.error.message).slice(0, 200)}`);
         }
 
-        const bloqueo = evento.promptFeedback?.blockReason;
-        if (typeof bloqueo === 'string') motivo = `bloqueado: ${bloqueo}`;
+        switch (evento.event_type) {
+          case 'step.start':
+            if (typeof evento.index === 'number') {
+              tipoDePaso.set(evento.index, evento.step?.type ?? '');
+            }
+            break;
 
-        const razon = evento.candidates?.[0]?.finishReason;
-        if (typeof razon === 'string') motivo = razon;
+          case 'step.delta': {
+            // Los pasos de razonamiento también emiten deltas, pero de firma,
+            // no de texto. Solo se escribe lo que el modelo quiso decir.
+            const esTexto = evento.delta?.type === 'text' && typeof evento.delta.text === 'string';
+            const paso = tipoDePaso.get(evento.index) ?? 'model_output';
+            if (esTexto && paso !== 'thought' && evento.delta.text) {
+              hubotexto = true;
+              yield { type: 'text', text: evento.delta.text };
+            }
+            break;
+          }
+
+          case 'interaction.completed': {
+            const uso = evento.interaction?.usage;
+            if (uso) {
+              usage.inputTokens = uso.total_input_tokens ?? usage.inputTokens;
+              usage.outputTokens = uso.total_output_tokens ?? usage.outputTokens;
+              // En streaming a veces solo llega el total: lo que falta se
+              // deduce en vez de quedarse en cero, que haría que el tope de
+              // gasto no frenara nunca.
+              if (!usage.outputTokens && uso.total_tokens) {
+                usage.outputTokens = Math.max(0, uso.total_tokens - usage.inputTokens);
+              }
+            }
+            motivo = evento.interaction?.status ?? motivo;
+            break;
+          }
+        }
       }
     }
 
-    // Si el proveedor no contó, se estima: un contador en cero haría que el
-    // tope de gasto no frenara nunca.
     if (usage.inputTokens === 0) {
       usage.inputTokens = approximateTokens(input.messages.map((m) => m.content).join(' '));
     }
+
     // Si no llegó texto, lo que Google mandó al final es la única pista. Se
     // registra recortado para que el log diga algo y no haya que adivinar.
     if (!hubotexto) {
       console.warn(
-        `Gemini no devolvió texto (modelo "${input.model}", motivo "${motivo || 'sin motivo'}"). Último bloque: ${ultimoBloque.slice(0, 400)}`,
+        `Gemini no devolvió texto (modelo "${input.model}", estado "${motivo || 'sin estado'}"). Último bloque: ${ultimoBloque.slice(0, 400)}`,
       );
     }
 
     yield { type: 'usage', usage };
-    if (motivo) yield { type: 'fin', motivo };
+    if (motivo && motivo !== 'completed') yield { type: 'fin', motivo };
   }
 
   async title(input: { model: string; messages: ModelMessage[] }): Promise<string> {
-    const res = await fetch(
-      `${this.baseUrl}/models/${encodeURIComponent(input.model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': this.apiKey },
-        body: JSON.stringify({
-          contents: input.messages.slice(0, 2).map((m) => ({
-            role: m.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: m.content }],
-          })),
-          systemInstruction: {
-            parts: [
-              {
-                text: 'Devuelve un título de máximo seis palabras para esta conversación. Sin comillas, sin punto final.',
-              },
-            ],
-          },
-          generationConfig: { maxOutputTokens: 24 },
-        }),
-      },
-    );
+    const res = await fetch(`${this.baseUrl}/interactions`, {
+      method: 'POST',
+      headers: this.cabeceras(),
+      body: JSON.stringify({
+        model: input.model,
+        input: this.pasos(input.messages.slice(0, 2)),
+        store: false,
+        system_instruction:
+          'Devuelve un título de máximo seis palabras para esta conversación. Sin comillas, sin punto final.',
+        generation_config: { max_output_tokens: 64 },
+      }),
+    });
     if (!res.ok) throw new Error(`El modelo respondió ${res.status} al titular`);
+
     const data = (await res.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      steps?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
     };
-    return (data.candidates?.[0]?.content?.parts?.[0]?.text ?? 'Conversación').trim().slice(0, 60);
+    // La respuesta viene en pasos, y antes del texto puede haber uno de
+    // razonamiento: se busca el de salida, no el primero.
+    const salida = (data.steps ?? []).find((p) => p.type === 'model_output');
+    const texto = (salida?.content ?? []).find((c) => c.type === 'text')?.text;
+    return (texto ?? 'Conversación').trim().slice(0, 60);
   }
 }
 
