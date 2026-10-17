@@ -21,7 +21,9 @@ import { AuthService } from './services/auth.service';
 import { ChatService } from './services/chat.service';
 import { UsageService } from './services/usage.service';
 import { createModelProvider } from './services/model.provider';
+import { ATTACHMENT_MAX_BYTES, AttachmentService } from './services/attachment.service';
 import { AuthController } from './controllers/auth.controller';
+import { AttachmentsController } from './controllers/attachments.controller';
 import { ConversationsController } from './controllers/conversations.controller';
 import { UsageController } from './controllers/usage.controller';
 import { HealthController } from './controllers/health.controller';
@@ -54,6 +56,9 @@ const app = new Veloce({
   title: 'Chat con IA API',
   version: '0.1.0',
   description: 'Chat con streaming de tokens sobre Veloce-TS',
+  // El tope por omisión del framework es 1 MiB y un PDF lo pasa sin esfuerzo.
+  // Este margen deja subir los 5 MiB del servicio más el sobre del multipart.
+  bodyLimit: ATTACHMENT_MAX_BYTES + 512 * 1024,
   cors: {
     origin: isAllowedOrigin,
     credentials: true,
@@ -134,6 +139,9 @@ container.register(AuthService, { factory: () => authService, scope: 'singleton'
 const usageService = new UsageService();
 container.register(UsageService, { factory: () => usageService, scope: 'singleton' });
 
+const attachmentService = new AttachmentService();
+container.register(AttachmentService, { factory: () => attachmentService, scope: 'singleton' });
+
 const modelProvider = createModelProvider();
 container.register('ModelProvider', { factory: () => modelProvider, scope: 'singleton' });
 container.register(ChatService, {
@@ -144,6 +152,7 @@ container.register(ChatService, {
 app.include(HealthController);
 app.include(AuthController);
 app.include(ConversationsController);
+app.include(AttachmentsController);
 app.include(UsageController);
 
 // Sin la bandera estas rutas no se registran, así que responden 404 y no 403:

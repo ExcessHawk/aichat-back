@@ -17,13 +17,14 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { BadRequestException, NotFoundException } from 'veloce-ts';
 import type { DrizzleDB } from '../db/client';
-import { conversations, messages } from '../db/schema';
+import { attachments, conversations, messages } from '../db/schema';
 import {
   approximateTokens,
   costInCents,
   type ModelMessage,
   type ModelProvider,
 } from './model.provider';
+import { CONTEXT_MAX_CHARS } from './attachment.service';
 import type { UsageService } from './usage.service';
 
 export type ChatEvent =
@@ -37,6 +38,47 @@ export class ChatService {
     private readonly provider: ModelProvider,
     private readonly usage: UsageService,
   ) {}
+
+  /**
+   * El texto de los documentos adjuntos, listo para el contexto.
+   *
+   * Va en el `system` y no como un mensaje más porque no es algo que nadie
+   * dijo: es material de referencia, y mezclarlo con el diálogo hace que el
+   * modelo lo cite como si fuera parte de la conversación.
+   *
+   * El tope es de los dos juntos. Diez archivos de 40 000 caracteres serían
+   * cuatrocientos mil en cada turno, y eso se paga cada vez.
+   */
+  private async contextoDeAdjuntos(db: DrizzleDB, conversationId: number): Promise<string> {
+    const filas = await db
+      .select({
+        filename: attachments.filename,
+        extractedText: attachments.extractedText,
+      })
+      .from(attachments)
+      .where(eq(attachments.conversationId, conversationId))
+      .orderBy(asc(attachments.id));
+
+    const piezas: string[] = [];
+    let total = 0;
+    for (const fila of filas) {
+      const texto = (fila.extractedText ?? '').trim();
+      if (!texto) continue;
+      const cabe = Math.max(0, CONTEXT_MAX_CHARS - total);
+      if (cabe === 0) break;
+      const recorte = texto.length > cabe ? `${texto.slice(0, cabe)}\n[…recortado]` : texto;
+      total += recorte.length;
+      piezas.push(`<documento nombre="${fila.filename}">\n${recorte}\n</documento>`);
+    }
+
+    if (piezas.length === 0) return '';
+    return [
+      'La persona adjuntó estos documentos. Úsalos cuando la pregunta tenga que',
+      'ver con ellos y dilo si no la tienen.',
+      '',
+      ...piezas,
+    ].join('\n');
+  }
 
   private modelo(id: string) {
     const info = this.provider.models.find((m) => m.id === id);
@@ -76,8 +118,12 @@ export class ChatService {
     if (!conversacion) throw new NotFoundException('Esa conversación no existe');
 
     const info = this.modelo(conversacion.model);
+    // Los adjuntos viajan en cada turno, así que son justo lo que hace que un
+    // turno barato se vuelva caro. Estimar sin ellos deja pasar lo que el tope
+    // existe para detener.
+    const documentos = await this.contextoDeAdjuntos(db, conversacion.id);
     const estimado = costInCents(info, {
-      inputTokens: approximateTokens(input.content),
+      inputTokens: approximateTokens(input.content + documentos),
       outputTokens: 400,
     });
     await this.usage.assertDentroDelLimite(db, input.userId, estimado);
@@ -110,6 +156,9 @@ export class ChatService {
       .from(messages)
       .where(eq(messages.conversationId, conversacion.id))
       .orderBy(asc(messages.id));
+
+    const documentos = await this.contextoDeAdjuntos(db, conversacion.id);
+    const sistema = [conversacion.systemPrompt, documentos].filter(Boolean).join('\n\n') || null;
 
     const historia: ModelMessage[] = previos
       .filter((m) => m.role !== 'system' && m.content.trim().length > 0)
@@ -151,7 +200,7 @@ export class ChatService {
     try {
       for await (const evento of this.provider.stream({
         model: conversacion.model,
-        system: conversacion.systemPrompt,
+        system: sistema,
         messages: historia,
         signal: control.signal,
       })) {

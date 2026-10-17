@@ -100,6 +100,13 @@ export class EchoModelProvider implements ModelProvider {
     const ultima = [...input.messages].reverse().find((m) => m.role === 'user');
     const tema = (ultima?.content ?? 'eso').trim().slice(0, 60).replace(/\s+/g, ' ');
 
+    // Los documentos adjuntos llegan en el `system`. Un modelo falso que los
+    // ignorara haría que adjuntar algo se viera inerte en la demostración, y
+    // que una prueba no pudiera distinguir "llegó" de "no llegó".
+    const nombres = [...(input.system ?? '').matchAll(/<documento nombre="([^"]+)">/g)].map(
+      (m) => m[1],
+    );
+
     // Determinista a partir de la pregunta: la misma entrada da la misma
     // respuesta, que es lo que hace posible probarlo.
     const indice = [...tema].reduce((n, c) => n + c.charCodeAt(0), 0) % RESPUESTAS.length;
@@ -107,7 +114,11 @@ export class EchoModelProvider implements ModelProvider {
     const texto = Array.from({ length: largo }, () => RESPUESTAS[indice].replace('{tema}', tema))
       .join('\n\n');
 
-    const pedazos = texto.match(/\s*\S+/g) ?? [texto];
+    const conDocumentos = nombres.length
+      ? `Con ${nombres.length === 1 ? 'el documento' : 'los documentos'} a la vista (${nombres.join(', ')}): ${texto}`
+      : texto;
+
+    const pedazos = conDocumentos.match(/\s*\S+/g) ?? [conDocumentos];
     let salida = 0;
 
     for (const pedazo of pedazos) {

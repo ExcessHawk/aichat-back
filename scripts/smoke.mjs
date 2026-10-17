@@ -234,6 +234,150 @@ check(
   `${salida} tokens cortados vs ${completa} de una completa`,
 )
 
+// ── adjuntos ──────────────────────────────────────────────────────────────────
+//
+// Lo que se vigila: que el texto salga del archivo de verdad, que un binario
+// disfrazado no pase, que el documento llegue al contexto del modelo, y que
+// nadie lea los adjuntos de otra persona.
+
+const { pdfConTexto } = await import('./lib/pdf-de-prueba.mjs')
+
+const adjuntar = async (conversationId, bytes, { token, filename, type } = {}) => {
+  const form = new FormData()
+  form.append('conversationId', String(conversationId))
+  form.append('file', new Blob([bytes], { type: type ?? 'application/octet-stream' }), filename)
+  const res = await fetch(`${API}/api/attachments`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  })
+  const texto = await res.text()
+  let data = texto
+  try {
+    data = JSON.parse(texto)
+  } catch {
+    /* no era JSON */
+  }
+  return { status: res.status, data }
+}
+
+const convDocs = await call('/api/conversations', { method: 'POST', token, body: {} })
+
+const MARKDOWN = new TextEncoder().encode(
+  ['# Notas de la reunión', '', 'Se acordó mover el corte al día 5.'].join('\n'),
+)
+const md = await adjuntar(convDocs.data.id, MARKDOWN, {
+  token,
+  filename: 'notas.md',
+  type: 'text/markdown',
+})
+check('se adjunta un markdown', md.status === 201, `status ${md.status}`)
+check('y se le saca el texto', md.data?.textChars > 20, `${md.data?.textChars} caracteres`)
+
+const PDF_REAL = pdfConTexto([
+  'Informe trimestral de ventas',
+  'El margen cayo tres puntos en marzo.',
+])
+const pdf = await adjuntar(convDocs.data.id, PDF_REAL, {
+  token,
+  filename: 'informe.pdf',
+  type: 'application/pdf',
+})
+check('se adjunta un PDF', pdf.status === 201, `status ${pdf.status}`)
+
+const textoPdf = psql(
+  `SELECT extracted_text FROM attachments WHERE id = ${Number(pdf.data?.id ?? 0)}`,
+)
+check(
+  'el texto sale del PDF, no del nombre del archivo',
+  textoPdf.includes('margen cayo tres puntos'),
+  JSON.stringify(textoPdf.slice(0, 60)),
+)
+
+const BINARIO = new Uint8Array([0x00, 0x01, 0x02, 0x03, 0xff, 0xfe, 0x00, 0x00, 0x7f, 0x00])
+const binario = await adjuntar(convDocs.data.id, BINARIO, {
+  token,
+  filename: 'documento.txt',
+  type: 'text/plain',
+})
+check('un binario con nombre de texto se rechaza', binario.status === 400, `status ${binario.status}`)
+
+const pdfRoto = await adjuntar(convDocs.data.id, new TextEncoder().encode('%PDF-1.4 roto'), {
+  token,
+  filename: 'roto.pdf',
+  type: 'application/pdf',
+})
+check('un PDF que no abre se rechaza', pdfRoto.status === 400, `status ${pdfRoto.status}`)
+
+const listaAdj = await call(`/api/conversations/${convDocs.data.id}/attachments`, { token })
+check('los adjuntos se listan', listaAdj.data?.attachments?.length === 2,
+  `${listaAdj.data?.attachments?.length} adjuntos`)
+check(
+  'la lista dice cuánto texto arrastra cada uno',
+  (listaAdj.data?.attachments ?? []).every((a) => a.textChars > 0),
+  JSON.stringify((listaAdj.data?.attachments ?? []).map((a) => a.textChars)),
+)
+
+const descarga = await fetch(`${API}/api/attachments/${pdf.data.id}/file`, {
+  headers: { Authorization: `Bearer ${token}` },
+})
+check('el archivo se descarga', descarga.status === 200, `status ${descarga.status}`)
+check(
+  'y llega como PDF',
+  (descarga.headers.get('content-type') ?? '').includes('application/pdf'),
+  descarga.headers.get('content-type'),
+)
+
+const sinSesionAdj = await fetch(`${API}/api/attachments/${pdf.data.id}/file`)
+check('sin sesión no se descarga', sinSesionAdj.status === 401, `status ${sinSesionAdj.status}`)
+
+// ── el documento llega al modelo ──────────────────────────────────────────────
+
+const conDocs = await leerCanal(`/api/conversations/${convDocs.data.id}/messages`, {
+  token,
+  body: { content: '¿Qué dice el informe?' },
+})
+const respuesta = conDocs.eventos
+  .filter((e) => e.type === 'token')
+  .map((e) => e.text)
+  .join('')
+check(
+  'el modelo recibe los documentos adjuntos',
+  respuesta.includes('informe.pdf') && respuesta.includes('notas.md'),
+  JSON.stringify(respuesta.slice(0, 80)),
+)
+
+// ── aislamiento ───────────────────────────────────────────────────────────────
+
+const otroToken = (
+  await call('/api/demo/session', { method: 'POST', body: { role: 'administrador' } })
+).data?.token
+
+const descargaAjena = await fetch(`${API}/api/attachments/${pdf.data.id}/file`, {
+  headers: { Authorization: `Bearer ${otroToken}` },
+})
+check('un adjunto ajeno no se descarga', descargaAjena.status === 404, `status ${descargaAjena.status}`)
+
+const subidaAjena = await adjuntar(convDocs.data.id, MARKDOWN, {
+  token: otroToken,
+  filename: 'intruso.md',
+  type: 'text/markdown',
+})
+check('ni se adjunta a una conversación ajena', subidaAjena.status === 404,
+  `status ${subidaAjena.status}`)
+
+// ── quitar ────────────────────────────────────────────────────────────────────
+
+const claveBorrada = psql(
+  `SELECT storage_key FROM attachments WHERE id = ${Number(md.data?.id ?? 0)}`,
+)
+const quitado = await call(`/api/attachments/${md.data.id}`, { method: 'DELETE', token })
+check('se quita un adjunto', quitado.status === 200, `status ${quitado.status}`)
+check(
+  'y el archivo deja de existir',
+  psql(`SELECT count(*)::int FROM attachments WHERE storage_key = '${claveBorrada}'`) === '0',
+)
+
 // ── el tope de gasto ──────────────────────────────────────────────────────────
 
 const uso1 = await call('/api/usage', { token })

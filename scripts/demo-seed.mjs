@@ -7,6 +7,9 @@
  *
  *   bun run demo:seed
  */
+import { mkdir, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join, resolve } from 'node:path'
 import { hash as argonHash } from '@node-rs/argon2'
 import { Client } from 'pg'
 
@@ -115,6 +118,70 @@ if (existentes[0].n === 0) {
   console.log(`  ${CONVERSACIONES.length} conversaciones con su historia`)
 } else {
   console.log(`  ${existentes[0].n} conversaciones ya estaban`)
+}
+
+// ── un documento adjunto, ya leído ───────────────────────────────────────────
+//
+// El plan pide que el visitante caiga en un mundo con historia, y parte de esa
+// historia es un documento del que ya se puede preguntar. El texto se guarda
+// extraído, igual que lo haría una subida de verdad.
+
+const DOCUMENTO = {
+  filename: 'politica-de-envios.md',
+  texto: [
+    '# Política de envíos',
+    '',
+    '## Zonas',
+    '',
+    'Local: dentro de la ciudad, 1 a 2 días hábiles. Nacional: 3 a 5 días.',
+    'No hay envío internacional.',
+    '',
+    '## Costos',
+    '',
+    'El costo lo pone cada vendedor por zona y peso. La plataforma no subsidia',
+    'envíos: lo que cobra el vendedor es lo que paga el comprador.',
+    '',
+    '## Retrasos',
+    '',
+    'Un pedido que pasa de 10 días hábiles sin entregar se puede aclarar. La',
+    'aclaración la resuelve la plataforma, no el vendedor, y puede terminar en',
+    'reembolso al comprador.',
+    '',
+    '## Lo que no cubre',
+    '',
+    'Dirección incompleta, nadie que reciba tras dos intentos, y paquetes',
+    'retenidos en aduana.',
+  ].join('\n'),
+}
+
+const { rows: yaHay } = await client.query(
+  `SELECT count(*)::int AS n FROM attachments a
+     JOIN conversations c ON c.id = a.conversation_id
+    WHERE c.user_id = $1`,
+  [usuario],
+)
+
+if (yaHay[0].n === 0) {
+  const { rows: destino } = await client.query(
+    `SELECT id FROM conversations WHERE user_id = $1 ORDER BY id LIMIT 1`,
+    [usuario],
+  )
+  if (destino.length) {
+    const dir = resolve(process.env.UPLOADS_DIR ?? './data/uploads')
+    await mkdir(dir, { recursive: true })
+    const key = `${randomUUID().replace(/-/g, '')}.md`
+    const bytes = Buffer.from(DOCUMENTO.texto, 'utf8')
+    await writeFile(join(dir, key), bytes)
+
+    await client.query(
+      `INSERT INTO attachments (conversation_id, filename, mime_type, size_bytes, storage_key, extracted_text)
+            VALUES ($1, $2, 'text/markdown', $3, $4, $5)`,
+      [destino[0].id, DOCUMENTO.filename, bytes.length, key, DOCUMENTO.texto],
+    )
+    console.log('  1 documento adjunto con su texto ya extraído')
+  }
+} else {
+  console.log(`  ${yaHay[0].n} adjunto(s) ya estaban`)
 }
 
 // El consumo del periodo, calculado de los mensajes para que cuadre con lo que

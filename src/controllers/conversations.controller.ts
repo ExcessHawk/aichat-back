@@ -25,7 +25,7 @@ import {
   AbortSignal as RequestAbortSignal,
 } from 'veloce-ts';
 import type { DrizzleDB } from '../db/client';
-import { conversations, messages } from '../db/schema';
+import { attachments, conversations, messages } from '../db/schema';
 import { ANY_ROLE, requireUser } from '../auth/current-user';
 import { ChatService, type ChatEvent } from '../services/chat.service';
 import {
@@ -178,6 +178,29 @@ export class ConversationsController {
       .limit(tope);
 
     return { messages: filas.reverse(), hasMore: filas.length === tope };
+  }
+
+  /** Los documentos que acompañan a esta conversación. */
+  @Get('/:id/attachments')
+  @Roles(ANY_ROLE)
+  async attachments(@Param('id') id: string, @Ctx() c: Context) {
+    const { conversacion } = await this.propia(c, id);
+    return {
+      attachments: await this.db
+        .select({
+          id: attachments.id,
+          filename: attachments.filename,
+          mimeType: attachments.mimeType,
+          sizeBytes: attachments.sizeBytes,
+          createdAt: attachments.createdAt,
+          // El largo del texto, no el texto: lo que importa en la lista es
+          // cuánto va a costar arrastrarlo, y el contenido ya está en el chat.
+          textChars: sql<number>`coalesce(length(${attachments.extractedText}), 0)::int`,
+        })
+        .from(attachments)
+        .where(eq(attachments.conversationId, conversacion.id))
+        .orderBy(asc(attachments.id)),
+    };
   }
 
   /**
