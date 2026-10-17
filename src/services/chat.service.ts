@@ -434,6 +434,8 @@ export class ChatService {
         model: this.modelo(conversacion.model).id,
         messages: utiles,
       });
+      // Vacío significa que el proveedor lo descartó por malo; se queda el
+      // respaldo, que es la pregunta.
       if (delModelo.trim()) titulo = delModelo.trim();
     } catch {
       /* se queda el de respaldo */

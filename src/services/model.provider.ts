@@ -56,6 +56,33 @@ export interface ModelProvider {
 
 export class ModelConfigurationError extends Error {}
 
+/** Lo que se le pide al modelo cuando se le pide un título. */
+export const PETICION_DE_TITULO =
+  'Resume de qué trata esta conversación en un título de dos a seis palabras. ' +
+  'Responde solo con el título: sin comillas, sin punto final, sin explicar nada.';
+
+/**
+ * Deja un título usable, o nada.
+ *
+ * Un modelo pequeño al que se le pide un título a veces devuelve la propia
+ * instrucción, una frase entera o un renglón con comillas. Un título malo es
+ * peor que ninguno: con nada, el servicio cae a la primera pregunta, que al
+ * menos dice de qué va.
+ */
+export function limpiarTitulo(crudo: string): string {
+  const linea = (crudo ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  const limpio = linea
+    .replace(/^[#*\-\s]+/, '')
+    .replace(/^["'«“]|["'»”.]+$/g, '')
+    .trim();
+
+  if (!limpio) return '';
+  // Si repite la instrucción, no entendió la tarea.
+  if (/instruc|title|t[ií]tulo de|responde solo/i.test(limpio)) return '';
+  if (limpio.split(/\s+/).length > 12) return '';
+  return limpio.slice(0, 60);
+}
+
 /**
  * El mensaje de un error del proveedor, en limpio.
  *
@@ -283,14 +310,13 @@ export class AnthropicModelProvider implements ModelProvider {
       body: JSON.stringify({
         model: input.model,
         max_tokens: 24,
-        system:
-          'Devuelve un título de máximo seis palabras para esta conversación. Sin comillas, sin punto final.',
+        system: PETICION_DE_TITULO,
         messages: input.messages.slice(0, 2),
       }),
     });
     if (!res.ok) throw new Error(`El modelo respondió ${res.status} al titular`);
     const data = (await res.json()) as { content?: Array<{ text?: string }> };
-    return (data.content?.[0]?.text ?? 'Conversación').trim().slice(0, 60);
+    return limpiarTitulo(data.content?.[0]?.text ?? '');
   }
 }
 
@@ -558,10 +584,14 @@ export class GeminiModelProvider implements ModelProvider {
       headers: this.cabeceras(),
       body: JSON.stringify({
         model: input.model,
-        input: this.pasos(input.messages.slice(0, 2)),
+        // La petición va como mensaje y no como instrucción de sistema: pedida
+        // así, el modelo devolvió más de una vez la propia instrucción en vez
+        // del título ("instruction: Return…" acabó en la lista de verdad).
+        input: [
+          ...this.pasos(input.messages.slice(0, 2)),
+          { type: 'user_input', content: [{ type: 'text', text: PETICION_DE_TITULO }] },
+        ],
         store: false,
-        system_instruction:
-          'Devuelve un título de máximo seis palabras para esta conversación. Sin comillas, sin punto final.',
         generation_config: { max_output_tokens: 64 },
       }),
     });
@@ -574,7 +604,7 @@ export class GeminiModelProvider implements ModelProvider {
     // razonamiento: se busca el de salida, no el primero.
     const salida = (data.steps ?? []).find((p) => p.type === 'model_output');
     const texto = (salida?.content ?? []).find((c) => c.type === 'text')?.text;
-    return (texto ?? 'Conversación').trim().slice(0, 60);
+    return limpiarTitulo(texto ?? '');
   }
 }
 
