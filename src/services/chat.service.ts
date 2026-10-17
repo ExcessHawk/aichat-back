@@ -21,6 +21,7 @@ import { attachments, conversations, messages } from '../db/schema';
 import {
   approximateTokens,
   costInCents,
+  type ModelEvent,
   type ModelMessage,
   type ModelProvider,
 } from './model.provider';
@@ -28,10 +29,62 @@ import { CONTEXT_MAX_CHARS } from './attachment.service';
 import type { UsageService } from './usage.service';
 
 export type ChatEvent =
+  /**
+   * Señal de vida mientras el modelo piensa.
+   *
+   * Un canal que no mueve un byte durante diez segundos se cierra solo: lo
+   * cierra Bun por inactividad, y a veces un proxy por su cuenta. Entonces el
+   * primer token llega a un canal muerto y el error que se ve no se parece en
+   * nada a la causa ("Controller is already closed", 502 sin cabeceras).
+   *
+   * Con `echo` nunca se notó porque emite en milisegundos; un modelo de verdad
+   * tarda más que eso en la primera palabra. El cliente lo ignora.
+   */
+  | { type: 'latido' }
   | { type: 'token'; text: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; costCents: number }
   | { type: 'done'; messageId: number; stopped: boolean }
   | { type: 'error'; message: string };
+
+/**
+ * Mezcla los eventos del modelo con un latido periódico.
+ *
+ * Lo que importa es que el canal empiece a moverse de inmediato y no se calle
+ * nunca más de `cada` milisegundos, pase lo que pase del otro lado.
+ */
+async function* conLatido<T>(
+  fuente: AsyncIterable<T>,
+  cada: number,
+  latido: () => T,
+): AsyncGenerator<T> {
+  const it = fuente[Symbol.asyncIterator]();
+  let siguiente = it.next();
+
+  while (true) {
+    let avisar: (v: 'latido') => void = () => {};
+    const reloj = new Promise<'latido'>((r) => {
+      avisar = r;
+    });
+    const temporizador = setTimeout(() => avisar('latido'), cada);
+
+    try {
+      const cual = await Promise.race([siguiente, reloj]);
+      if (cual === 'latido') {
+        yield latido();
+        continue;
+      }
+      const { done, value } = cual as IteratorResult<T>;
+      if (done) return;
+      yield value;
+      siguiente = it.next();
+    } finally {
+      clearTimeout(temporizador);
+    }
+  }
+}
+
+/** Cada cuánto se avisa de que seguimos vivos mientras el modelo piensa. */
+const LATIDO_MS = Number(process.env.STREAM_HEARTBEAT_MS ?? 4000);
 
 export class ChatService {
   constructor(
@@ -220,13 +273,27 @@ export class ChatService {
     let salida = 0;
     let completo = false;
 
+    // Lo primero que sale por el canal, antes de hablar con el modelo: así las
+    // cabeceras viajan ya y nadie cierra la conexión por callada.
+    yield { type: 'latido' };
+
     try {
-      for await (const evento of this.provider.stream({
-        model: conversacion.model,
-        system: sistema,
-        messages: historia,
-        signal: control.signal,
-      })) {
+      // El tipo se amplía a mano: el proveedor solo sabe de texto y uso, y el
+      // latido es cosa del canal, no del modelo.
+      for await (const evento of conLatido<ModelEvent | { type: 'latido' }>(
+        this.provider.stream({
+          model: conversacion.model,
+          system: sistema,
+          messages: historia,
+          signal: control.signal,
+        }),
+        LATIDO_MS,
+        () => ({ type: 'latido' as const }),
+      )) {
+        if (evento.type === 'latido') {
+          yield evento;
+          continue;
+        }
         if (evento.type === 'text') {
           acumulado += evento.text;
           yield { type: 'token', text: evento.text };
