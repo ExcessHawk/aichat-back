@@ -5,6 +5,11 @@
 #
 # La imagen es pgvector y no postgres a secas: los embeddings viven en la misma
 # base que los mensajes, que es la razón de no tener una base vectorial aparte.
+# El nombre va escrito y no deducido del directorio. Sin esto, compose lo saca
+# de la carpeta —"backend"—, que es exactamente el nombre que ya usa la pila
+# del marketplace: un `docker compose down` aquí se llevaría la base de allá.
+name: aichat
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
