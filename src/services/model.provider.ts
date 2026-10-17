@@ -339,10 +339,17 @@ export class GeminiModelProvider implements ModelProvider {
   constructor(
     private readonly apiKey: string,
     private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
-    /** Tope duro por respuesta. Lo que no se genera no se paga. */
-    private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 800),
-    /** Cuánto puede pensar antes de contestar. Cero lo apaga. */
-    private readonly thinkingBudget = Number(process.env.GEMINI_THINKING_BUDGET ?? 0),
+    /**
+     * Tope duro por respuesta. Lo que no se genera no se paga, pero aquí cabe
+     * también lo que el modelo piense antes de escribir: quedarse corto hace
+     * que gaste todo razonando y devuelva una respuesta vacía.
+     */
+    private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 2048),
+    /** Null deja que el modelo decida. Un número lo fuerza; cero lo apaga. */
+    private readonly thinkingBudget: number | null =
+      process.env.GEMINI_THINKING_BUDGET === undefined || process.env.GEMINI_THINKING_BUDGET === ''
+        ? null
+        : Number(process.env.GEMINI_THINKING_BUDGET),
   ) {
     if (!apiKey) throw new ModelConfigurationError('Falta GEMINI_API_KEY');
     this.models = modelosDeEntorno();
@@ -358,11 +365,12 @@ export class GeminiModelProvider implements ModelProvider {
       ...(input.system ? { systemInstruction: { parts: [{ text: input.system }] } } : {}),
       generationConfig: {
         maxOutputTokens: this.maxOutputTokens,
-        // Los modelos 3.x piensan antes de contestar, y esos tokens salen del
-        // MISMO presupuesto. Con un tope chico el modelo se lo gasta pensando
-        // y devuelve una respuesta vacía que igual se cobra. Un presupuesto de
-        // cero lo apaga; súbelo si alguna vez interesa el razonamiento.
-        thinkingConfig: { thinkingBudget: this.thinkingBudget },
+        // Los modelos 3.x piensan antes de contestar y esos tokens salen del
+        // MISMO presupuesto, así que el tope tiene que dar para pensar Y para
+        // responder. Apagar el pensamiento con un presupuesto de cero no es
+        // seguro: hay modelos que entonces no devuelven nada. Por eso solo se
+        // manda si alguien lo pide a propósito.
+        ...(this.thinkingBudget === null ? {} : { thinkingConfig: { thinkingBudget: this.thinkingBudget } }),
       },
     };
   }
@@ -392,6 +400,8 @@ export class GeminiModelProvider implements ModelProvider {
     const decoder = new TextDecoder();
     let buffer = '';
     let motivo = '';
+    let ultimoBloque = '';
+    let hubotexto = false;
     const usage: ModelUsage = { inputTokens: 0, outputTokens: 0 };
 
     while (true) {
@@ -421,6 +431,7 @@ export class GeminiModelProvider implements ModelProvider {
         if (Array.isArray(partes)) {
           for (const parte of partes) {
             if (typeof parte?.text === 'string' && parte.text) {
+              hubotexto = true;
               yield { type: 'text', text: parte.text };
             }
           }
@@ -433,6 +444,17 @@ export class GeminiModelProvider implements ModelProvider {
           usage.outputTokens = meta.candidatesTokenCount ?? usage.outputTokens;
         }
 
+        ultimoBloque = crudo;
+
+        // Google puede mandar su propio error DENTRO del canal, ya con las
+        // cabeceras enviadas. Sin esto se veía como una respuesta vacía.
+        if (evento.error?.message) {
+          throw new Error(`El modelo respondió: ${String(evento.error.message).slice(0, 200)}`);
+        }
+
+        const bloqueo = evento.promptFeedback?.blockReason;
+        if (typeof bloqueo === 'string') motivo = `bloqueado: ${bloqueo}`;
+
         const razon = evento.candidates?.[0]?.finishReason;
         if (typeof razon === 'string') motivo = razon;
       }
@@ -443,6 +465,14 @@ export class GeminiModelProvider implements ModelProvider {
     if (usage.inputTokens === 0) {
       usage.inputTokens = approximateTokens(input.messages.map((m) => m.content).join(' '));
     }
+    // Si no llegó texto, lo que Google mandó al final es la única pista. Se
+    // registra recortado para que el log diga algo y no haya que adivinar.
+    if (!hubotexto) {
+      console.warn(
+        `Gemini no devolvió texto (modelo "${input.model}", motivo "${motivo || 'sin motivo'}"). Último bloque: ${ultimoBloque.slice(0, 400)}`,
+      );
+    }
+
     yield { type: 'usage', usage };
     if (motivo) yield { type: 'fin', motivo };
   }
