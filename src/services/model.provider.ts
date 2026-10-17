@@ -56,6 +56,28 @@ export interface ModelProvider {
 
 export class ModelConfigurationError extends Error {}
 
+/**
+ * El mensaje de un error del proveedor, en limpio.
+ *
+ * Lo que devuelven estas APIs es un JSON anidado con enlaces de consola y
+ * metadatos. Volcarlo entero en la burbuja del chat le enseña a un visitante
+ * un objeto en crudo; lo que sirve es la frase de dentro.
+ */
+export function mensajeDeError(crudo: string): string {
+  try {
+    const datos = JSON.parse(crudo);
+    const mensaje = datos?.error?.message ?? datos?.message;
+    if (typeof mensaje === 'string' && mensaje.trim()) {
+      // Las frases de Google terminan en una URL de consola larguísima que no
+      // le dice nada a quien está mirando el chat.
+      return mensaje.split(/\s*(?:Visita|Enable it by visiting|visiting)\s+https?:\/\//)[0].trim().slice(0, 240);
+    }
+  } catch {
+    /* no era JSON: se usa tal cual */
+  }
+  return crudo.slice(0, 240);
+}
+
 /** Lo que cuesta una respuesta, redondeado hacia arriba al centavo. */
 export function costInCents(model: ModelInfo, usage: ModelUsage): number {
   const cents =
@@ -418,8 +440,10 @@ export class GeminiModelProvider implements ModelProvider {
 
     if (!res.ok || !res.body) {
       const detalle = await res.text().catch(() => '');
+      // El log se queda con todo; la burbuja, solo con la frase.
+      if (detalle) console.error(`Gemini ${res.status}: ${detalle.slice(0, 600)}`);
       throw new Error(
-        `El modelo respondió ${res.status}${detalle ? `: ${detalle.slice(0, 200)}` : ''}`,
+        `El modelo respondió ${res.status}${detalle ? `: ${mensajeDeError(detalle)}` : ''}`,
       );
     }
 
@@ -461,7 +485,8 @@ export class GeminiModelProvider implements ModelProvider {
         // Google puede mandar su propio error DENTRO del canal, con las
         // cabeceras ya enviadas. Sin esto se vería como una respuesta vacía.
         if (evento.error?.message) {
-          throw new Error(`El modelo respondió: ${String(evento.error.message).slice(0, 200)}`);
+          console.error(`Gemini mandó un error por el canal: ${crudo.slice(0, 600)}`);
+          throw new Error(`El modelo respondió: ${mensajeDeError(crudo)}`);
         }
 
         switch (evento.event_type) {
