@@ -265,6 +265,161 @@ export class AnthropicModelProvider implements ModelProvider {
   }
 }
 
+// ─── Adaptador de Gemini ──────────────────────────────────────────────────────
+
+/**
+ * Precios en centavos de dólar por millón de tokens.
+ *
+ * Los precios de los modelos cambian, y un número viejo aquí no rompe nada
+ * ruidosamente: solo hace que el contador y el tope mientan. Por eso se pueden
+ * ajustar por entorno sin tocar código, y conviene revisarlos contra la página
+ * de precios de Google de vez en cuando.
+ */
+const MODELOS_GEMINI: ModelInfo[] = [
+  {
+    id: 'gemini-2.0-flash',
+    label: 'Gemini 2.0 Flash',
+    inputCentsPerMillion: Number(process.env.GEMINI_FLASH_IN_CENTS ?? 10),
+    outputCentsPerMillion: Number(process.env.GEMINI_FLASH_OUT_CENTS ?? 40),
+  },
+  {
+    id: 'gemini-2.5-flash',
+    label: 'Gemini 2.5 Flash',
+    inputCentsPerMillion: Number(process.env.GEMINI_FLASH25_IN_CENTS ?? 30),
+    outputCentsPerMillion: Number(process.env.GEMINI_FLASH25_OUT_CENTS ?? 250),
+  },
+]
+
+export class GeminiModelProvider implements ModelProvider {
+  readonly name = 'gemini';
+  readonly models = MODELOS_GEMINI;
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta',
+    /** Tope duro por respuesta. Lo que no se genera no se paga. */
+    private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 800),
+  ) {
+    if (!apiKey) throw new ModelConfigurationError('Falta GEMINI_API_KEY');
+  }
+
+  private cuerpo(input: StreamInput) {
+    return {
+      contents: input.messages.map((m) => ({
+        // Gemini llama "model" a lo que el resto llama "assistant".
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      })),
+      ...(input.system ? { systemInstruction: { parts: [{ text: input.system }] } } : {}),
+      generationConfig: { maxOutputTokens: this.maxOutputTokens },
+    };
+  }
+
+  async *stream(input: StreamInput): AsyncIterable<ModelEvent> {
+    const res = await fetch(
+      `${this.baseUrl}/models/${encodeURIComponent(input.model)}:streamGenerateContent?alt=sse`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': this.apiKey },
+        // La señal llega hasta aquí. Sin esto, cancelar solo cierra el canal
+        // con el navegador y el modelo sigue produciendo tokens que ya nadie
+        // va a leer, pero que sí se cobran.
+        signal: input.signal,
+        body: JSON.stringify(this.cuerpo(input)),
+      },
+    );
+
+    if (!res.ok || !res.body) {
+      const detalle = await res.text().catch(() => '');
+      throw new Error(
+        `El modelo respondió ${res.status}${detalle ? `: ${detalle.slice(0, 200)}` : ''}`,
+      );
+    }
+
+    const lector = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const usage: ModelUsage = { inputTokens: 0, outputTokens: 0 };
+
+    while (true) {
+      const { done, value } = await lector.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let corte = buffer.indexOf('\n\n');
+      while (corte !== -1) {
+        const bloque = buffer.slice(0, corte);
+        buffer = buffer.slice(corte + 2);
+        corte = buffer.indexOf('\n\n');
+
+        const linea = bloque.split('\n').find((l) => l.startsWith('data:'));
+        if (!linea) continue;
+        const crudo = linea.slice(5).trim();
+        if (!crudo || crudo === '[DONE]') continue;
+
+        let evento: Record<string, any>;
+        try {
+          evento = JSON.parse(crudo);
+        } catch {
+          continue;
+        }
+
+        const partes = evento.candidates?.[0]?.content?.parts;
+        if (Array.isArray(partes)) {
+          for (const parte of partes) {
+            if (typeof parte?.text === 'string' && parte.text) {
+              yield { type: 'text', text: parte.text };
+            }
+          }
+        }
+
+        // El uso llega en cada trozo y se va actualizando; el último manda.
+        const meta = evento.usageMetadata;
+        if (meta) {
+          usage.inputTokens = meta.promptTokenCount ?? usage.inputTokens;
+          usage.outputTokens = meta.candidatesTokenCount ?? usage.outputTokens;
+        }
+      }
+    }
+
+    // Si el proveedor no contó, se estima: un contador en cero haría que el
+    // tope de gasto no frenara nunca.
+    if (usage.inputTokens === 0) {
+      usage.inputTokens = approximateTokens(input.messages.map((m) => m.content).join(' '));
+    }
+    yield { type: 'usage', usage };
+  }
+
+  async title(input: { model: string; messages: ModelMessage[] }): Promise<string> {
+    const res = await fetch(
+      `${this.baseUrl}/models/${encodeURIComponent(input.model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': this.apiKey },
+        body: JSON.stringify({
+          contents: input.messages.slice(0, 2).map((m) => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+          })),
+          systemInstruction: {
+            parts: [
+              {
+                text: 'Devuelve un título de máximo seis palabras para esta conversación. Sin comillas, sin punto final.',
+              },
+            ],
+          },
+          generationConfig: { maxOutputTokens: 24 },
+        }),
+      },
+    );
+    if (!res.ok) throw new Error(`El modelo respondió ${res.status} al titular`);
+    const data = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    return (data.candidates?.[0]?.content?.parts?.[0]?.text ?? 'Conversación').trim().slice(0, 60);
+  }
+}
+
 /**
  * Cuál se usa.
  *
@@ -276,6 +431,9 @@ export function createModelProvider(): ModelProvider {
   const elegido = process.env.MODEL_PROVIDER ?? 'echo';
   if (elegido === 'anthropic') {
     return new AnthropicModelProvider(process.env.ANTHROPIC_API_KEY ?? '');
+  }
+  if (elegido === 'gemini') {
+    return new GeminiModelProvider(process.env.GEMINI_API_KEY ?? '');
   }
   return new EchoModelProvider(Number(process.env.ECHO_CHUNK_MS ?? 18));
 }

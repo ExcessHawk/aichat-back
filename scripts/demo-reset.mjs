@@ -57,7 +57,10 @@ const pasos = [
   // Las conversaciones se van enteras: los mensajes y los adjuntos cuelgan de
   // ellas en cascada.
   ['conversaciones y sus mensajes', `DELETE FROM conversations WHERE user_id IN ${demoUsers}`],
-  ['consumo del periodo', `DELETE FROM usage_limits WHERE user_id IN ${demoUsers}`],
+  // El consumo del periodo NO se borra. Es lo único que impide que la
+  // demostración gaste sin fin cuando detrás hay un modelo de paga: este
+  // script corre cada hora, así que vaciarlo convertiría un tope mensual en
+  // un tope por hora. Lo gastado se gastó.
   ['sesiones abiertas', `DELETE FROM refresh_tokens WHERE user_id IN ${demoUsers}`],
   ['bitácora', `DELETE FROM audit_logs WHERE user_id IN ${demoUsers}`],
   [
