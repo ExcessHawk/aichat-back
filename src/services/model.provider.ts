@@ -275,24 +275,59 @@ export class AnthropicModelProvider implements ModelProvider {
  * ajustar por entorno sin tocar código, y conviene revisarlos contra la página
  * de precios de Google de vez en cuando.
  */
-const MODELOS_GEMINI: ModelInfo[] = [
-  {
-    id: 'gemini-2.0-flash',
-    label: 'Gemini 2.0 Flash',
-    inputCentsPerMillion: Number(process.env.GEMINI_FLASH_IN_CENTS ?? 10),
-    outputCentsPerMillion: Number(process.env.GEMINI_FLASH_OUT_CENTS ?? 40),
-  },
-  {
-    id: 'gemini-2.5-flash',
-    label: 'Gemini 2.5 Flash',
-    inputCentsPerMillion: Number(process.env.GEMINI_FLASH25_IN_CENTS ?? 30),
-    outputCentsPerMillion: Number(process.env.GEMINI_FLASH25_OUT_CENTS ?? 250),
-  },
-]
+/**
+ * Qué modelos ofrece Gemini, leídos del entorno.
+ *
+ * Estaban escritos en el código y Google retiró uno: la demostración empezó a
+ * contestar "This model is no longer available" y hacía falta un despliegue
+ * para algo que es configuración. Ahora se declaran así, separados por comas:
+ *
+ *   GEMINI_MODELS="id:Etiqueta:centavosEntrada:centavosSalida,otro:..."
+ *
+ * Los centavos son por millón de tokens y son lo que alimenta el contador y el
+ * tope de gasto. Si envejecen, el tope miente sin avisar.
+ *
+ * Para ver qué ofrece de verdad tu llave: `bun run models:gemini`.
+ */
+function modelosDeEntorno(): ModelInfo[] {
+  const crudo = process.env.GEMINI_MODELS?.trim();
+  if (!crudo) {
+    return [
+      {
+        id: process.env.GEMINI_MODEL ?? 'gemini-3.8-flash',
+        label: process.env.GEMINI_MODEL_LABEL ?? 'Gemini 3.8 Flash',
+        inputCentsPerMillion: Number(process.env.GEMINI_FLASH_IN_CENTS ?? 30),
+        outputCentsPerMillion: Number(process.env.GEMINI_FLASH_OUT_CENTS ?? 250),
+      },
+    ];
+  }
+
+  const modelos = crudo
+    .split(',')
+    .map((trozo) => trozo.trim())
+    .filter(Boolean)
+    .map((trozo) => {
+      const [id, label, entrada, salida] = trozo.split(':').map((x) => x.trim());
+      if (!id) return null;
+      return {
+        id,
+        label: label || id,
+        inputCentsPerMillion: Number(entrada ?? 30) || 30,
+        outputCentsPerMillion: Number(salida ?? 250) || 250,
+      } satisfies ModelInfo;
+    })
+    .filter((m): m is ModelInfo => m !== null);
+
+  if (modelos.length === 0) {
+    throw new ModelConfigurationError('GEMINI_MODELS está puesto pero no declara ningún modelo');
+  }
+  return modelos;
+}
+
 
 export class GeminiModelProvider implements ModelProvider {
   readonly name = 'gemini';
-  readonly models = MODELOS_GEMINI;
+  readonly models: ModelInfo[];
 
   constructor(
     private readonly apiKey: string,
@@ -301,6 +336,7 @@ export class GeminiModelProvider implements ModelProvider {
     private readonly maxOutputTokens = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS ?? 800),
   ) {
     if (!apiKey) throw new ModelConfigurationError('Falta GEMINI_API_KEY');
+    this.models = modelosDeEntorno();
   }
 
   private cuerpo(input: StreamInput) {

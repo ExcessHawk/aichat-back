@@ -17,7 +17,8 @@
     "smoke": "bun run scripts/smoke.mjs",
     "demo:seed": "bun run scripts/demo-seed.mjs",
     "demo:reset": "bun run scripts/demo-reset.mjs",
-    "demo:refresh": "bun run scripts/demo-reset.mjs && bun run scripts/demo-seed.mjs"
+    "demo:refresh": "bun run scripts/demo-reset.mjs && bun run scripts/demo-seed.mjs",
+    "models:gemini": "bun run scripts/models-gemini.mjs"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.2.2",
