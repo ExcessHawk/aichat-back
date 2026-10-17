@@ -80,10 +80,33 @@ export class ChatService {
     ].join('\n');
   }
 
+  /** Los modelos que ya no existen, avisados una sola vez y no en cada turno. */
+  private avisados = new Set<string>();
+
+  /**
+   * El modelo de una conversación.
+   *
+   * Cambiar de proveedor deja huérfanas las conversaciones viejas: sus ids
+   * pertenecían al proveedor anterior. Romperlas con un 400 convertiría un
+   * cambio de configuración en una demostración muerta, así que se sigue con
+   * el primero disponible. Lo que de verdad se usó queda escrito en la fila
+   * del mensaje, que es donde importa para la cuenta.
+   */
   private modelo(id: string) {
     const info = this.provider.models.find((m) => m.id === id);
-    if (!info) throw new BadRequestException(`El modelo "${id}" no está disponible`);
-    return info;
+    if (info) return info;
+
+    const sustituto = this.provider.models[0];
+    if (!sustituto) {
+      throw new BadRequestException(`El modelo "${id}" no está disponible`);
+    }
+    if (!this.avisados.has(id)) {
+      this.avisados.add(id);
+      console.warn(
+        `El modelo "${id}" no existe en el proveedor "${this.provider.name}"; se usa "${sustituto.id}".`,
+      );
+    }
+    return sustituto;
   }
 
   modelosDisponibles() {

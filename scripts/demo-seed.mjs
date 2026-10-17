@@ -22,6 +22,14 @@ if (!DATABASE_URL) {
   process.exit(1)
 }
 
+// Los modelos salen del proveedor configurado, no escritos a mano: si la caja
+// corre con Gemini, sembrar conversaciones con ids de "echo" las dejaría
+// apuntando a algo que ese proveedor no conoce.
+const { createModelProvider } = await import('../src/services/model.provider.ts')
+const modelos = createModelProvider().models
+const MODELO_CORTO = modelos[0].id
+const MODELO_LARGO = (modelos[1] ?? modelos[0]).id
+
 const client = new Client({ connectionString: DATABASE_URL })
 await client.connect()
 
@@ -59,7 +67,7 @@ console.log('  2 cuentas de demostración')
 const CONVERSACIONES = [
   {
     title: 'Por qué el carrito se vacía solo',
-    model: 'echo-rapido',
+    model: MODELO_CORTO,
     turnos: [
       [
         'Tengo un carrito que se vacía solo cada cierto tiempo y no encuentro dónde.',
@@ -73,7 +81,7 @@ const CONVERSACIONES = [
   },
   {
     title: 'Streaming sin que la interfaz se trabe',
-    model: 'echo-largo',
+    model: MODELO_LARGO,
     turnos: [
       [
         '¿Por qué se traba el chat cuando llegan muchos tokens seguidos?',
@@ -101,8 +109,11 @@ if (existentes[0].n === 0) {
       const entrada = Math.ceil(pregunta.length / 4)
       const salida = Math.ceil(respuesta.length / 4)
       // Mismo precio que declara el proveedor falso para ese modelo.
-      const precioSalida = conv.model === 'echo-largo' ? 7500 : 1500
-      const costo = Math.ceil((entrada * 300) / 1_000_000 + (salida * precioSalida) / 1_000_000)
+      const info = modelos.find((m) => m.id === conv.model) ?? modelos[0]
+      const precioSalida = info.outputCentsPerMillion
+      const costo = Math.ceil(
+        (entrada * info.inputCentsPerMillion) / 1_000_000 + (salida * precioSalida) / 1_000_000,
+      )
 
       await client.query(
         `INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)`,
