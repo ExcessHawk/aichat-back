@@ -366,6 +366,14 @@ export class ChatService {
     }
   }
 
+  /**
+   * Cierra el mensaje del asistente.
+   *
+   * El mensaje se insertó vacío antes de empezar para que una caída dejara el
+   * parcial. Pero si no llegó ni una palabra no hay parcial que guardar: lo
+   * que queda es un turno fantasma con etiqueta y sin texto, que además se le
+   * manda al modelo como contexto en los turnos siguientes. Se borra.
+   */
   private async cerrar(
     db: DrizzleDB,
     messageId: number,
@@ -377,6 +385,11 @@ export class ChatService {
       stoppedByUser: boolean;
     },
   ) {
+    if (!datos.content.trim()) {
+      await db.delete(messages).where(eq(messages.id, messageId));
+      return;
+    }
+
     await db
       .update(messages)
       .set({ ...datos, streaming: false, updatedAt: new Date() })
@@ -409,14 +422,27 @@ export class ChatService {
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
     if (utiles.length === 0) return;
 
+    // Si el modelo no puede titular —cuota, un fallo pasajero— la conversación
+    // se quedaba "Sin título" para siempre, y la lista acababa llena de filas
+    // indistinguibles. La primera pregunta no es un gran título, pero dice de
+    // qué va, que es todo lo que esa lista necesita.
+    const deRespaldo = utiles[0].content.trim().replace(/\s+/g, ' ').slice(0, 60);
+
+    let titulo = deRespaldo;
     try {
-      const titulo = await this.provider.title({ model: conversacion.model, messages: utiles });
-      await db
-        .update(conversations)
-        .set({ title: titulo, updatedAt: new Date() })
-        .where(eq(conversations.id, conversationId));
+      const delModelo = await this.provider.title({
+        model: this.modelo(conversacion.model).id,
+        messages: utiles,
+      });
+      if (delModelo.trim()) titulo = delModelo.trim();
     } catch {
-      /* sin título se vive */
+      /* se queda el de respaldo */
     }
+
+    if (!titulo) return;
+    await db
+      .update(conversations)
+      .set({ title: titulo, updatedAt: new Date() })
+      .where(eq(conversations.id, conversationId));
   }
 }
