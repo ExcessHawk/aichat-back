@@ -162,23 +162,35 @@ const { rows: yaHay } = await client.query(
 )
 
 if (yaHay[0].n === 0) {
-  const { rows: destino } = await client.query(
-    `SELECT id FROM conversations WHERE user_id = $1 ORDER BY id LIMIT 1`,
-    [usuario],
-  )
-  if (destino.length) {
-    const dir = resolve(process.env.UPLOADS_DIR ?? './data/uploads')
-    await mkdir(dir, { recursive: true })
-    const key = `${randomUUID().replace(/-/g, '')}.md`
-    const bytes = Buffer.from(DOCUMENTO.texto, 'utf8')
-    await writeFile(join(dir, key), bytes)
-
-    await client.query(
-      `INSERT INTO attachments (conversation_id, filename, mime_type, size_bytes, storage_key, extracted_text)
-            VALUES ($1, $2, 'text/markdown', $3, $4, $5)`,
-      [destino[0].id, DOCUMENTO.filename, bytes.length, key, DOCUMENTO.texto],
+  // El documento es un adorno del mundo sembrado, no la razón de este script.
+  // Si el disco no deja escribir —permisos del volumen, por ejemplo— se avisa
+  // fuerte y se sigue: antes esto reventaba aquí y la demostración se quedaba
+  // sin el consumo del periodo, con el error escondido tres pasos atrás.
+  try {
+    const { rows: destino } = await client.query(
+      `SELECT id FROM conversations WHERE user_id = $1 ORDER BY id LIMIT 1`,
+      [usuario],
     )
-    console.log('  1 documento adjunto con su texto ya extraído')
+    if (destino.length) {
+      const dir = resolve(process.env.UPLOADS_DIR ?? './data/uploads')
+      await mkdir(dir, { recursive: true })
+      const key = `${randomUUID().replace(/-/g, '')}.md`
+      const bytes = Buffer.from(DOCUMENTO.texto, 'utf8')
+      await writeFile(join(dir, key), bytes)
+
+      await client.query(
+        `INSERT INTO attachments (conversation_id, filename, mime_type, size_bytes, storage_key, extracted_text)
+              VALUES ($1, $2, 'text/markdown', $3, $4, $5)`,
+        [destino[0].id, DOCUMENTO.filename, bytes.length, key, DOCUMENTO.texto],
+      )
+      console.log('  1 documento adjunto con su texto ya extraído')
+    }
+  } catch (e) {
+    console.error('')
+    console.error('  AVISO: no se pudo sembrar el documento adjunto.')
+    console.error(`  ${e.message}`)
+    console.error('  La demostración queda sin él; lo demás sí se sembró.')
+    console.error('')
   }
 } else {
   console.log(`  ${yaHay[0].n} adjunto(s) ya estaban`)

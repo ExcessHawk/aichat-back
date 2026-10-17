@@ -149,6 +149,14 @@ container.register(ChatService, {
   scope: 'singleton',
 });
 
+// En veloce-ts 3.5.1 el empaquetador plegó la comprobación de NODE_ENV a una
+// constante verdadera, así que el manejador de errores se cree en desarrollo
+// pase lo que pase y adjunta el stack a cada 500 — en una respuesta pública.
+// Esto lo apaga a mano hasta que el framework publique el arreglo.
+if (process.env.NODE_ENV === 'production') {
+  app.getErrorHandler().setDevelopmentMode(false);
+}
+
 app.include(HealthController);
 app.include(AuthController);
 app.include(ConversationsController);
